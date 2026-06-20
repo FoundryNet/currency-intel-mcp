@@ -1,0 +1,43 @@
+name: "@foundrynet/currency-intel-mcp"
+displayName: "FoundryNet Currency Intelligence"
+description: >-
+  Real-time exchange rates, instant currency conversion, historical rate lookups, and trend analysis from ECB and central bank sources.
+icon: "💱"
+homepage: "https://foundrynet.io"
+repository: "https://github.com/FoundryNet/currency-intel-mcp"
+license: "MIT"
+categories:
+  - finance
+  - data
+tags:
+  - exchange-rates
+  - currency-conversion
+  - forex
+  - historical-rates
+  - ecb
+  - currency-data
+keywords:
+  - exchange-rates
+  - currency-conversion
+  - forex
+  - historical-rates
+  - ecb
+  - currency-data
+attestation:
+  protocol: "MINT Protocol"
+  verified_outputs: true
+  live_feed: "https://mint.foundrynet.io/feed"
+network:
+  name: "FoundryNet Data Network"
+  servers: 17
+startCommand:
+  type: http
+  url: "https://currency-intel-mcp-production.up.railway.app/mcp"
+  transport: streamable-http
+  configSchema:
+    type: object
+    properties:
+      api_key:
+        type: string
+        title: "Forge billing key (optional)"
+        description: "fnet_ key to bypass the per-query x402 paywall and bill to a Forge account."
