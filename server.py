@@ -9,6 +9,7 @@ from the ECB (Frankfurter) with exchangerate.host as backup.
   rates           — all current rates for a base currency      (free)
   historical_rate — the rate for a pair on a past date         ($0.005)
   rate_trend      — rate history + trend + volatility          ($0.01)
+  transaction_cost— cross-border payment landed cost by method ($0.01)
   daily_brief     — curated daily FX movers brief              ($5)
   mint_info       — FoundryNet Data Network + MINT cross-promo (free)
 
@@ -32,6 +33,7 @@ import currency_aggregator as agg
 import daily_curator
 import identity
 import payment_gate
+import x402_standard
 import supa
 import tools
 
@@ -60,7 +62,8 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok", "service": "currency-intel-mcp", "transport": "streamable-http",
         "network": "FoundryNet Data Network",
-        "tools": ["convert", "rates", "historical_rate", "rate_trend", "daily_brief", "mint_info"],
+        "tools": ["convert", "rates", "historical_rate", "rate_trend", "transaction_cost",
+                  "daily_brief", "mint_info"],
         "dataset": "supabase:fx_rates" if supa.configured() else "unconfigured",
         "rate_source": "ECB (Frankfurter) + exchangerate.host backup",
         "agg_interval_minutes": config.AGG_INTERVAL_MINUTES,
@@ -69,6 +72,7 @@ async def health(request: Request) -> JSONResponse:
         "prices_usdc": {"convert": 0, "rates": 0,
                         "historical_rate": config.PRICE_HISTORICAL_RATE,
                         "rate_trend": config.PRICE_RATE_TREND,
+                        "transaction_cost": config.PRICE_TRANSACTION_COST,
                         "daily_brief": config.PRICE_DAILY_BRIEF},
         "free_tier_daily": config.FREE_TIER_DAILY,
         "payment_recipient": config.PAYMENT_RECIPIENT,
@@ -158,6 +162,16 @@ async def rest_daily_brief(request: Request) -> JSONResponse:
                                            api_key=identity.bearer(request)))
 
 
+@mcp.custom_route("/v1/transaction-cost", methods=["POST"])
+async def rest_transaction_cost(request: Request) -> JSONResponse:
+    b = await _json_body(request)
+    return _resp(await core.do_transaction_cost(
+        b.get("amount"), _frm(b), _to(b), b.get("method", "wire"),
+        agent_key=_akey(request, b),
+        payment_tx=b.get("payment_tx"),
+        api_key=identity.bearer(request)))
+
+
 @mcp.custom_route("/v1/mint-info", methods=["GET", "POST"])
 async def rest_mint(request: Request) -> JSONResponse:
     return JSONResponse(core.mint_info())
@@ -166,19 +180,19 @@ async def rest_mint(request: Request) -> JSONResponse:
 # ── Discovery ────────────────────────────────────────────────────────────────
 _AGENT_CARD = {
     "name": "Currency & Exchange Rate MCP",
-    "description": ("Convert currencies and query exchange rates — free conversion and "
-                    "live rates, plus paid historical rates and trend/volatility analytics "
-                    "from ECB reference data."),
+    "description": ("Cross-border payment cost calculator — total landed cost including FX "
+                    "spread, transfer fees, and settlement time by payment method. Also "
+                    "provides real-time exchange rates and currency conversion."),
     "url": config.PUBLIC_MCP_URL,
     "version": "1.0.0",
     "capabilities": {"tools": ["convert", "rates", "historical_rate", "rate_trend",
-                               "daily_brief", "mint_info"]},
+                               "transaction_cost", "daily_brief", "mint_info"]},
     "provider": {"name": "FoundryNet", "url": "https://foundrynet.io"},
     "network": "FoundryNet Data Network",
     "attestation": {"protocol": "MINT Protocol",
                     "endpoint": "https://mint-mcp-production.up.railway.app/mcp",
                     "verified_outputs": True, "live_feed": "https://mint.foundrynet.io/feed", "feed_api": "https://mint-mcp-production.up.railway.app/v1/feed"},
-    "protocols": {"mcp": {"endpoint": config.PUBLIC_MCP_URL, "transport": "streamable-http", "tools_count": 6},
+    "protocols": {"mcp": {"endpoint": config.PUBLIC_MCP_URL, "transport": "streamable-http", "tools_count": 7},
                   "x402": {"supported": True, "currency": "USDC", "network": "solana"}},
     "contact": "hello@foundrynet.io",
 }
@@ -215,16 +229,19 @@ async def server_card(request: Request) -> JSONResponse:
                                            "and rate_trend give 50 free queries/day then take an "
                                            "fnet_ Bearer key OR x402 USDC.")},
         "tools": live, "version": "1.0", "name": "Currency & Exchange Rate MCP",
-        "tagline": "Free currency conversion + paid FX history & trends for agents.",
-        "description": ("Currency conversion and exchange-rate intelligence: free convert + "
-                        "live rates, plus paid historical rates and trend/volatility analytics. "
-                        "ECB reference data, refreshed hourly. The free conversion gateway every "
-                        "agent handling international transactions needs."),
+        "tagline": "Cross-border payment cost calculator + free FX conversion for agents.",
+        "description": ("Cross-border payment cost calculator — total landed cost including FX "
+                        "spread, transfer fees, and settlement time by payment method. Also "
+                        "provides real-time exchange rates and currency conversion. ECB "
+                        "reference data, refreshed hourly. The conversion gateway every agent "
+                        "handling international transactions needs."),
         "serverUrl": config.PUBLIC_MCP_URL, "transport": "streamable-http",
         "tools_count": len(live),
         "categories": ["finance", "data", "currency", "fx", "utilities"],
         "keywords": ["currency conversion", "exchange rates", "forex", "fx", "ecb",
-                     "historical rates", "currency trend"],
+                     "historical rates", "currency trend", "cross-border-payments",
+                     "fx-cost", "international-transfer", "payment-calculator",
+                     "remittance-cost"],
         "network": "FoundryNet Data Network", "see_also": config.SISTER_SERVERS,
         "pricing": {"model": "metered",
                     "free_tier": "convert + rates are free; 50 paid queries/day per agent",
@@ -256,6 +273,47 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
         "network": {"name": "FoundryNet Data Network", "servers": 17,
                     "homepage": "https://foundrynet.io"},
     }, headers={"Cache-Control": "public, max-age=300"})
+
+
+
+# ── Standard x402 compliance (discoverable on x402scan / 402 Index / CDP Bazaar) ──
+@mcp.custom_route("/x402", methods=["GET"])
+async def x402_index(request: Request) -> JSONResponse:
+    return JSONResponse(x402_standard.index(),
+                        headers={"Cache-Control": "public, max-age=300",
+                                 "Access-Control-Allow-Origin": "*"})
+
+
+@mcp.custom_route("/.well-known/x402", methods=["GET"])
+async def x402_wellknown(request: Request) -> JSONResponse:
+    return JSONResponse(x402_standard.index(),
+                        headers={"Cache-Control": "public, max-age=300",
+                                 "Access-Control-Allow-Origin": "*"})
+
+
+@mcp.custom_route("/x402/{tool}", methods=["GET", "POST"])
+async def x402_resource(request: Request) -> JSONResponse:
+    tool = request.path_params["tool"]
+    if tool not in x402_standard.PAID_TOOLS:
+        return JSONResponse({"error": "unknown_resource", "tool": tool,
+                             "available": list(x402_standard.PAID_TOOLS)}, status_code=404)
+    challenge = x402_standard.payment_required_header(tool)
+    return JSONResponse(x402_standard.payment_required(tool), status_code=402,
+                        headers={"Cache-Control": "public, max-age=300",
+                                 "Access-Control-Allow-Origin": "*",
+                                 "PAYMENT-REQUIRED": challenge,
+                                 "X-PAYMENT": challenge,
+                                 "Link": '</openapi.json>; rel="describedby"',
+                                 "WWW-Authenticate": 'x402 version="2"'})
+
+
+@mcp.custom_route("/openapi.json", methods=["GET"])
+async def openapi_doc(request: Request) -> JSONResponse:
+    """OpenAPI 3.1 discovery doc — x402scan requires a spec at a discoverable URL."""
+    return JSONResponse(x402_standard.openapi(),
+                        headers={"Cache-Control": "public, max-age=300",
+                                 "Access-Control-Allow-Origin": "*",
+                                 "Link": '</openapi.json>; rel="describedby"'})
 
 
 def build_dual_app():

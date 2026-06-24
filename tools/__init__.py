@@ -12,6 +12,8 @@ from . import rates as rates_tool
 from . import historical_rate as historical_rate_tool
 from . import rate_trend as rate_trend_tool
 from . import daily_brief as daily_brief_tool
+from . import brief_summary as brief_summary_tool
+from . import transaction_cost as transaction_cost_tool
 from . import mint as mint_tool
 
 
@@ -21,4 +23,6 @@ def register_all(mcp) -> None:
     historical_rate_tool.register(mcp)
     rate_trend_tool.register(mcp)
     daily_brief_tool.register(mcp)
+    brief_summary_tool.register(mcp)
+    transaction_cost_tool.register(mcp)
     mint_tool.register(mcp)

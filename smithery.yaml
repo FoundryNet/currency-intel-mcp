@@ -1,7 +1,7 @@
 name: "@foundrynet/currency-intel-mcp"
 displayName: "FoundryNet Currency Intelligence"
 description: >-
-  Real-time exchange rates, instant currency conversion, historical rate lookups, and trend analysis from ECB and central bank sources.
+  Cross-border payment cost calculator — total landed cost including FX spread, transfer fees, and settlement time by payment method. Also provides real-time exchange rates, instant currency conversion, historical rate lookups, and trend analysis from ECB and central bank sources.
 icon: "💱"
 homepage: "https://foundrynet.io"
 repository: "https://github.com/FoundryNet/currency-intel-mcp"
@@ -16,6 +16,11 @@ tags:
   - historical-rates
   - ecb
   - currency-data
+  - cross-border-payments
+  - fx-cost
+  - international-transfer
+  - payment-calculator
+  - remittance-cost
 keywords:
   - exchange-rates
   - currency-conversion
@@ -23,6 +28,11 @@ keywords:
   - historical-rates
   - ecb
   - currency-data
+  - cross-border-payments
+  - fx-cost
+  - international-transfer
+  - payment-calculator
+  - remittance-cost
 attestation:
   protocol: "MINT Protocol"
   verified_outputs: true

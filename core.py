@@ -17,6 +17,7 @@ import currency_sources as src
 import daily_curator
 import mint_integration
 import payment_gate
+import stripe_gate
 import supa
 
 logger = logging.getLogger("cur.core")
@@ -196,12 +197,31 @@ async def do_rate_trend(frm: str, to: str, days, *, agent_key, payment_tx=None, 
 
 
 # ── daily_brief (premium, curated) ────────────────────────────────────────────
-async def do_daily_brief(date, *, agent_key, payment_tx=None, api_key=None) -> dict:
+async def do_daily_brief(date, *, agent_key, payment_tx=None, api_key=None,
+                         stripe_token=None) -> dict:
     day = (date or _today()).strip()
+
+    # Stripe rail (parallel to x402): a paid Checkout Session unlocks the brief.
+    stripe_err = None
+    if stripe_token and stripe_gate.is_active():
+        sv = await stripe_gate.verify_session(stripe_token, config.PRICE_DAILY_BRIEF,
+                                              tool="daily_brief", agent_key=agent_key)
+        if sv["ok"]:
+            brief = await daily_curator.get_brief(day)
+            if not brief:
+                return {"error": "not_available",
+                        "detail": f"No brief for {day} (not yet generated, or expired at midnight UTC). "
+                                  f"Briefs are curated daily at {config.BRIEF_HOUR_UTC:02d}:00 UTC.",
+                        "billing": "stripe"}
+            await daily_curator.bump_purchase(day)
+            return {**brief, "billing": "stripe", "stripe_session": sv["session"]}
+        stripe_err = sv.get("detail")  # surface on the 402 below
+
     decision = await payment_gate.precheck("daily_brief", {"date": day},
                                            config.PRICE_DAILY_BRIEF, agent_key, payment_tx, api_key)
     if decision["gate"] == "blocked":
-        return decision["body"]
+        return stripe_gate.augment_402(decision["body"], config.PRICE_DAILY_BRIEF,
+                                       stripe_error=stripe_err)
     brief = await daily_curator.get_brief(day)
     if not brief:
         return {"error": "not_available",
@@ -210,6 +230,83 @@ async def do_daily_brief(date, *, agent_key, payment_tx=None, api_key=None) -> d
                 "billing": _billing(decision)}
     await daily_curator.bump_purchase(day)
     return {**brief, "billing": _billing(decision)}
+
+
+# ── transaction_cost (PAID $0.01): cross-border transaction cost calculator ───
+_FEE_SCHEDULES = {
+    "wire":   {"fixed": 25.0, "pct": 0.001,  "settlement_days": 2, "name": "Bank Wire (SWIFT)"},
+    "ach":    {"fixed": 5.0,  "pct": 0.0005, "settlement_days": 3, "name": "ACH Transfer"},
+    "crypto": {"fixed": 0.5,  "pct": 0.001,  "settlement_days": 0, "name": "USDC/Stablecoin"},
+    "card":   {"fixed": 0.0,  "pct": 0.029,  "settlement_days": 1, "name": "Credit/Debit Card"},
+    "paypal": {"fixed": 0.30, "pct": 0.029,  "settlement_days": 1, "name": "PayPal"},
+}
+_SPREAD_PCT = {"wire": 0.005, "card": 0.015, "crypto": 0.001}
+
+
+async def do_transaction_cost(amount, from_currency, to_currency, method="wire", *,
+                              agent_key, payment_tx=None, api_key=None) -> dict:
+    frm, to = _ccy(from_currency), _ccy(to_currency)
+    if not frm or not to:
+        return {"error": "bad_request", "detail": "from_currency and to_currency are required"}
+    try:
+        amt = float(amount)
+    except (TypeError, ValueError):
+        return {"error": "bad_request", "detail": "amount must be a number"}
+    if amt <= 0:
+        return {"error": "bad_request", "detail": "amount must be greater than 0"}
+    method = (method or "wire").strip().lower()
+
+    dec = await payment_gate.precheck("transaction_cost",
+                                      {"amount": amt, "from": frm, "to": to, "method": method},
+                                      config.PRICE_TRANSACTION_COST, agent_key, payment_tx, api_key)
+    if dec["gate"] == "blocked":
+        return dec["body"]
+
+    rate_data = await do_convert(amt, frm, to)
+    if not rate_data or "error" in rate_data:
+        return {"error": "source_error", "detail": "Could not fetch exchange rate",
+                "billing": _billing(dec)}
+    converted = rate_data.get("converted")
+    rate = rate_data.get("rate")
+    if converted is None or rate is None:
+        return {"error": "source_error", "detail": "Could not fetch exchange rate",
+                "billing": _billing(dec)}
+
+    fee_info = _FEE_SCHEDULES.get(method, _FEE_SCHEDULES["wire"])
+    spread_pct = _SPREAD_PCT.get(method, 0.01)
+    spread_cost = converted * spread_pct
+    transfer_fee = fee_info["fixed"] + amt * fee_info["pct"]
+    total_cost = spread_cost + transfer_fee
+    effective_rate = rate * (1 - spread_pct)
+    total_cost_pct = (total_cost / converted * 100) if converted else None
+
+    out = {
+        "payment": {
+            "amount": amt, "from": frm, "to": to,
+            "mid_market_rate": rate, "converted_at_mid": converted,
+        },
+        "costs": {
+            "fx_spread": round(spread_cost, 2),
+            "fx_spread_pct": f"{round(spread_pct * 100, 3)}%",
+            "transfer_fee": round(transfer_fee, 2),
+            "total_cost": round(total_cost, 2),
+            "total_cost_pct": (f"{round(total_cost_pct, 3)}%" if total_cost_pct is not None else None),
+        },
+        "effective": {
+            "rate": round(effective_rate, 6),
+            "you_receive": round(converted - spread_cost, 2),
+            "settlement_days": fee_info["settlement_days"],
+        },
+        "method": fee_info["name"],
+        "cheaper_alternative": (
+            "Consider USDC/stablecoin transfer — near-zero fees, instant settlement"
+            if method != "crypto" and total_cost > 10 else None),
+        "as_of": rate_data.get("as_of"),
+        "billing": _billing(dec),
+    }
+    out["provenance"] = await asyncio.to_thread(
+        mint_integration.attest_data, out, "analysis", "cross-border transaction cost")
+    return out
 
 
 def mint_info() -> dict:
@@ -274,8 +371,11 @@ def _make_upsell(_fn):
             except Exception:  # noqa: BLE001
                 pass
             try:
-                import asyncio as _aio, mint_integration as _mint
-                result["foundrynet_network"] = await _aio.to_thread(_mint.network_heartbeat)
+                import asyncio as _aio, mint_integration as _mint, upsell_engine as _upsell_engine
+                _hb = await _aio.to_thread(_mint.network_heartbeat)
+                _av, _ct = await _brief_status_cached()
+                result["foundrynet_network"] = {**_hb, **_upsell_engine.get_upsell(
+                    brief_price=config.PRICE_DAILY_BRIEF, brief_signal_count=(_ct if _av else None))}
             except Exception:  # noqa: BLE001
                 pass
         return result
@@ -283,6 +383,51 @@ def _make_upsell(_fn):
     return _wrapped
 
 
-for _upsell_fn in ("do_historical_rate", "do_rate_trend"):
+for _upsell_fn in ("do_historical_rate", "do_rate_trend", "do_transaction_cost"):
     if _upsell_fn in globals():
         globals()[_upsell_fn] = _make_upsell(globals()[_upsell_fn])
+
+
+
+# ── brief_summary ($0.50): structured top-5 sample of today's brief (upsell) ──
+def _top_signals(brief: dict, n: int = 5) -> list:
+    """Flatten a brief's signals into a flat top-N list — structure-agnostic
+    (works whether `signals` is a dict-of-categories or a flat list)."""
+    sig = (brief or {}).get("signals")
+    items: list = []
+    if isinstance(sig, dict):
+        for cat, val in sig.items():
+            if isinstance(val, list):
+                for it in val:
+                    items.append({"category": cat, **(it if isinstance(it, dict) else {"value": it})})
+            elif isinstance(val, dict):
+                items.append({"category": cat, **val})
+            elif val not in (None, "", 0):
+                items.append({"category": cat, "value": val})
+    elif isinstance(sig, list):
+        items = sig
+    return items[:n]
+
+
+async def do_brief_summary(date, *, agent_key, payment_tx=None, api_key=None):
+    """Top-5 signals from today's brief as structured JSON (no prose) — the $0.50
+    sample that upsells the full daily_brief."""
+    from datetime import datetime, timezone
+    day = (date or datetime.now(timezone.utc).strftime("%Y-%m-%d")).strip()
+    dec = await payment_gate.precheck("brief_summary", {"date": day}, config.PRICE_BRIEF_SUMMARY,
+                                      agent_key, payment_tx, api_key)
+    if dec["gate"] == "blocked":
+        return dec["body"]
+    brief = await daily_curator.get_brief(day)
+    if not brief:
+        return {"error": "not_available",
+                "detail": f"No brief for {day} yet (curated daily; expires next midnight UTC).",
+                "billing": _billing(dec)}
+    return {
+        "date": day,
+        "top_signals": _top_signals(brief, 5),
+        "total_signals": brief.get("signal_count"),
+        "full_brief": {"tool": "daily_brief", "price_usd": config.PRICE_DAILY_BRIEF,
+                       "note": "Full brief returns all signals with complete detail + MINT attestation."},
+        "billing": _billing(dec),
+    }
